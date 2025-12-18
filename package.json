@@ -1,0 +1,7 @@
+{
+  "name": "angel-streamer",
+  "type": "module",
+  "scripts": {
+    "start": "node streamer.js"
+  }
+}
