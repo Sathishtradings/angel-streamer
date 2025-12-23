@@ -3,5 +3,10 @@
   "type": "module",
   "scripts": {
     "start": "node streamer.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.89.0",
+    "dotenv": "^17.2.3",
+    "smartapi-javascript": "^1.0.27"
   }
 }
