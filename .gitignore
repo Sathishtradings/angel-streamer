@@ -1,2 +1,5 @@
-node_modules
+node_modules/
 .env
+.env.*
+npm-debug.log*
+pm2.log*
