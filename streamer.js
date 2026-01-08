@@ -1,4 +1,4 @@
-// streamer.js — Angel One Live Price Streamer (DB-driven tokens)
+// streamer.js — Angel One Live Price Streamer (Market Hours + DB Tokens)
 
 import { createRequire } from "module";
 import { createClient } from "@supabase/supabase-js";
@@ -33,12 +33,11 @@ for (const k of REQUIRED_ENVS) {
 /* ================= CONFIG ================= */
 const CONFIG = {
   RECONNECT_DELAY: 5000,
-  FATAL_ERROR_DELAY: 10000,
   HEARTBEAT_INTERVAL: 30000,
-  MAX_RECONNECT_ATTEMPTS: 5,
   SESSION_REFRESH_INTERVAL: 60 * 60 * 1000, // 1 hour
   TOKEN_CHUNK_SIZE: 400, // Angel safe limit
-  CHUNK_DELAY: 3000,     // ms between subscriptions
+  CHUNK_DELAY: 3000,     // delay between chunk subscribe
+  MARKET_RECHECK_DELAY: 5 * 60 * 1000, // 5 min
 };
 
 /* ================= SUPABASE ================= */
@@ -54,13 +53,24 @@ const smartApi = new SmartAPI({
 
 /* ================= STATE ================= */
 let ws = null;
-let sessionData = null;
-let reconnectAttempts = 0;
-let heartbeatTimer = null;
 let sessionRefreshTimer = null;
-let isConnecting = false;
+let heartbeatTimer = null;
 let lastMessageTime = Date.now();
-let priceUpdateCount = 0;
+let isConnecting = false;
+
+/* ================= MARKET HOURS ================= */
+function isMarketOpen() {
+  const now = new Date();
+  const ist = new Date(
+    now.toLocaleString("en-US", { timeZone: "Asia/Kolkata" })
+  );
+
+  const day = ist.getDay(); // 0=Sun,6=Sat
+  if (day === 0 || day === 6) return false;
+
+  const minutes = ist.getHours() * 60 + ist.getMinutes();
+  return minutes >= (9 * 60 + 15) && minutes <= (15 * 60 + 30);
+}
 
 /* ================= TOTP ================= */
 function generateTOTP() {
@@ -77,7 +87,7 @@ function generateTOTP() {
   return totp.generate();
 }
 
-/* ================= DB TOKEN LOADER ================= */
+/* ================= TOKEN LOADER ================= */
 async function loadTokensFromDB() {
   const { data, error } = await supabase
     .from("symbol_token_map")
@@ -91,13 +101,19 @@ async function loadTokensFromDB() {
   return tokens;
 }
 
+/* ================= RESET OLD DATA ================= */
+async function resetLivePrices() {
+  await supabase.from("live_prices").delete().neq("token", "");
+  console.log("🧹 Cleared previous day prices");
+}
+
 /* ================= UTILS ================= */
 function chunkArray(arr, size) {
-  const chunks = [];
+  const out = [];
   for (let i = 0; i < arr.length; i += size) {
-    chunks.push(arr.slice(i, i + size));
+    out.push(arr.slice(i, i + size));
   }
-  return chunks;
+  return out;
 }
 
 /* ================= SESSION ================= */
@@ -116,9 +132,8 @@ async function createSession() {
     throw new Error("Angel login failed");
   }
 
-  console.log("✅ Angel login successful");
-  sessionData = session.data;
   scheduleSessionRefresh();
+  console.log("✅ Angel login successful");
   return session.data;
 }
 
@@ -137,9 +152,9 @@ function startHeartbeat() {
   if (heartbeatTimer) clearInterval(heartbeatTimer);
 
   heartbeatTimer = setInterval(() => {
-    if (Date.now() - lastMessageTime > CONFIG.HEARTBEAT_INTERVAL * 2) {
-      console.warn("⚠️ No data for 60s — reconnecting");
-      reconnect();
+    if (Date.now() - lastMessageTime > CONFIG.HEARTBEAT_INTERVAL * 4) {
+      console.warn("⚠️ No data — reconnecting");
+      cleanup().then(start);
     }
   }, CONFIG.HEARTBEAT_INTERVAL);
 }
@@ -153,10 +168,10 @@ function stopHeartbeat() {
 async function updatePrice(data) {
   if (!data?.token || !data?.last_traded_price) return;
 
-  const price = data.last_traded_price / 100;
   lastMessageTime = Date.now();
+  const price = data.last_traded_price / 100;
 
-  const { error } = await supabase
+  await supabase
     .from("live_prices")
     .upsert(
       {
@@ -167,10 +182,7 @@ async function updatePrice(data) {
       { onConflict: "token" }
     );
 
-  if (!error) {
-    priceUpdateCount++;
-    console.log(`💹 ${data.token} → ₹${price}`);
-  }
+  console.log(`💹 ${data.token} → ₹${price}`);
 }
 
 /* ================= WEBSOCKET ================= */
@@ -184,43 +196,22 @@ function setupWebSocket(session) {
 
   ws.on("tick", updatePrice);
 
-  ws.on("error", err => {
-    console.error("❌ WS error:", err);
-  });
-
+  ws.on("error", err => console.error("❌ WS error:", err));
   ws.on("close", () => {
     console.log("⚠️ WS closed");
     stopHeartbeat();
-    reconnect();
   });
-
-  return ws;
 }
 
 /* ================= CLEANUP ================= */
 async function cleanup() {
   stopHeartbeat();
   if (sessionRefreshTimer) clearTimeout(sessionRefreshTimer);
-  sessionRefreshTimer = null;
 
   if (ws) {
     try { ws.close(); } catch {}
     ws = null;
   }
-}
-
-/* ================= RECONNECT ================= */
-async function reconnect() {
-  if (isConnecting) return;
-
-  reconnectAttempts++;
-  if (reconnectAttempts > CONFIG.MAX_RECONNECT_ATTEMPTS) {
-    reconnectAttempts = 0;
-    setTimeout(start, CONFIG.FATAL_ERROR_DELAY);
-    return;
-  }
-
-  setTimeout(start, CONFIG.RECONNECT_DELAY * reconnectAttempts);
 }
 
 /* ================= START ================= */
@@ -229,7 +220,15 @@ async function start() {
   isConnecting = true;
 
   try {
+    if (!isMarketOpen()) {
+      console.log("⏰ Market closed — sleeping");
+      setTimeout(start, CONFIG.MARKET_RECHECK_DELAY);
+      isConnecting = false;
+      return;
+    }
+
     await cleanup();
+    await resetLivePrices();
 
     const session = await createSession();
     setupWebSocket(session);
@@ -240,34 +239,30 @@ async function start() {
 
     startHeartbeat();
 
-    const allTokens = await loadTokensFromDB();
-    const chunks = chunkArray(allTokens, CONFIG.TOKEN_CHUNK_SIZE);
+    const tokens = await loadTokensFromDB();
+    const chunks = chunkArray(tokens, CONFIG.TOKEN_CHUNK_SIZE);
 
-    chunks.forEach((chunk, idx) => {
-      setTimeout(() => {
-        ws.fetchData({
-          correlationID: `prices_${idx}`,
-          action: 1,
-          mode: 1,
-          exchangeType: 1, // NSE
-          tokens: chunk,
-        });
-        console.log(`✅ Subscribed chunk ${idx + 1}/${chunks.length}`);
-      }, idx * CONFIG.CHUNK_DELAY);
-    });
+    setTimeout(() => {
+      chunks.forEach((chunk, idx) => {
+        setTimeout(() => {
+          ws.fetchData({
+            correlationID: `prices_${idx}`,
+            action: 1,
+            mode: 1,
+            exchangeType: 1, // NSE
+            tokens: chunk,
+          });
+          console.log(`✅ Subscribed chunk ${idx + 1}/${chunks.length}`);
+        }, idx * CONFIG.CHUNK_DELAY);
+      });
+    }, 3000);
 
-    isConnecting = false;
   } catch (err) {
-    isConnecting = false;
     console.error("🔥 Fatal error:", err.message);
-    setTimeout(start, CONFIG.FATAL_ERROR_DELAY);
+  } finally {
+    isConnecting = false;
   }
 }
-
-/* ================= STATS ================= */
-setInterval(() => {
-  console.log(`📊 Updates: ${priceUpdateCount} | Uptime: ${Math.floor(process.uptime()/60)} min`);
-}, 300000);
 
 /* ================= SHUTDOWN ================= */
 process.on("SIGINT", async () => {
@@ -283,5 +278,5 @@ process.on("SIGTERM", async () => {
 });
 
 /* ================= RUN ================= */
-console.log("🚀 Angel One DB-Driven Price Streamer Started");
+console.log("🚀 Angel One Market-Hour Streamer Started");
 start();
